@@ -3,7 +3,6 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision.transforms.v2
 from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets, transforms
 import pytorch_lightning as pl
@@ -23,51 +22,94 @@ class SemiSupervisedMNIST(pl.LightningModule):
                                      nn.ReLU(),
                                      nn.Linear(250, 250),
                                      nn.ReLU(),
-                                     nn.BatchNorm1d(250, eps=0.001, momentum=0.99),
+                                     nn.BatchNorm1d(250),
                                      nn.Dropout(p=1-keep_prob))
         self.classify = nn.Linear(250, 10)
+        self.xentropy = nn.BCEWithLogitsLoss()
 
-        def init_weights(layer):
-            if isinstance(layer, nn.Linear):
-                torch.nn.init.xavier_uniform_(layer.weight)
-                layer.bias.data.fill_(0.)
-        self.extract.apply(init_weights)
-        torch.nn.init.xavier_uniform_(self.classify.weight)
-        self.classify.bias.data.fill_(0.)
-
-        self.xentropy = nn.BCEWithLogitsLoss(reduction='none')
-        # self.crop = torchvision.transforms.v2.Compose([torchvision.transforms.v2.RandomCrop(size=25),
-        #                                                torchvision.transforms.v2.Resize(size=26, antialias=True),
-        #                                                torchvision.transforms.v2.Pad(padding=1)])
-        self.crop = torchvision.transforms.v2.Compose([torchvision.transforms.v2.RandomCrop(size=25),
-                                                       torchvision.transforms.v2.Pad(padding=(1,1,2,2))])
     def standardize(self, image):
         """
-        Matches tf.image.per_image_standardization ops:
+        Matches tf.image.per_image_standardization exactly:
         https://github.com/tensorflow/tensorflow/blob/master/tensorflow/python/ops/image_ops_impl.py
         """
-        # assuming [N, C, H, W] tensors by convention
+        image = image.view(-1, 28, 28, 1)
         num_pixels = 28 * 28
+        #
+        # # TF uses these exact constants
+        # image_mean = x.mean(dim=(1, 2), keepdim=True)
+        # variance = torch.var(x, dim=(1, 2), keepdim=True, unbiased=False)
+        # stddev = torch.sqrt(variance + 1e-6)
+        # min_stddev = torch.ones_like(stddev) / torch.sqrt(torch.tensor(num_pixels).float())
+        # pixel_value_scale = torch.max(stddev, min_stddev)
+        #
+        # x_normalized = (x - image_mean) / pixel_value_scale
+        # return x_normalized
+        """
+        Linearly scales each image in `image` to have mean 0 and variance 1.
+
+        Args:
+            image (torch.Tensor): An n-D Tensor with at least 3 dimensions, where the last 3 dimensions
+                                  represent the image (height, width, channels).
+
+        Returns:
+            torch.Tensor: A Tensor with the same shape as `image` and dtype `float32`, where each image
+                          has mean 0 and variance 1.
+
+        Raises:
+            ValueError: If the input image has fewer than 3 dimensions.
+        """
         if image.dim() < 3:
             raise ValueError("Input image must have at least 3 dimensions.")
+
+        # Convert the image to float32 if it's not already
         image = image.to(torch.float32)
-        image_mean = image.mean(dim=(-1, -2), keepdim=True)
-        image_stddev = image.std(dim=(-1, -2), keepdim=True)
-        # protect against small vars
+
+        # Calculate the number of pixels in the last 3 dimensions (height, width, channels)
+        # num_pixels = image.numel() // image.shape[-3:]
+
+        # Compute the mean over the last 3 dimensions (height, width, channels)
+        image_mean = image.mean(dim=(-1, -2, -3), keepdim=True)
+
+        # Compute the standard deviation over the last 3 dimensions (height, width, channels)
+        image_stddev = image.std(dim=(-1, -2, -3), keepdim=True)
+
+        # Compute the minimum standard deviation to protect against small variances
         min_stddev = torch.rsqrt(torch.tensor(float(num_pixels), dtype=torch.float32))
+
+        # Adjust the standard deviation by taking the maximum of the computed stddev and min_stddev
         adjusted_stddev = torch.maximum(image_stddev, min_stddev)
 
+        # Subtract the mean and divide by the adjusted standard deviation
         standardized_image = (image - image_mean) / adjusted_stddev
 
         return standardized_image
 
     def augment(self, x):
+        batch_size = x.size(0)
 
         # Add Gaussian noise
         noise = torch.randn_like(x) * 0.3
         x = x + noise
-        # Random crop to 25x25 and pad to 28x28
-        x = self.crop(x)
+
+        # Random crop and resize
+        x = x.permute(0, 3, 1, 2)  # NHWC -> NCHW
+
+        # Crop to 25x25
+        crop_size = 25
+        margin = (28 - crop_size) // 2
+        start_h = torch.randint(0, margin * 2 + 1, (batch_size,))
+        start_w = torch.randint(0, margin * 2 + 1, (batch_size,))
+
+        cropped = []
+        for i in range(batch_size):
+            h, w = start_h[i], start_w[i]
+            crop = x[i:i + 1, :, h:h + crop_size, w:w + crop_size]
+            # Resize back to 28x28
+            crop = F.interpolate(crop, size=(28, 28), mode='bilinear', align_corners=False)
+            cropped.append(crop)
+
+        x = torch.cat(cropped, dim=0)
+        x = x.permute(0, 2, 3, 1)  # NCHW -> NHWC
         return x
 
     def forward(self, x):
@@ -81,18 +123,39 @@ class SemiSupervisedMNIST(pl.LightningModule):
         x = self.classify(x)
         return x
 
+    # def compute_wmc(self, logits):
+    #     normalized_logits = torch.sigmoid(logits)
+    #     batch_size = logits.size(0)
+    #     wmc = torch.zeros(batch_size, device=logits.device)
+    #
+    #     for i in range(10):
+    #         one_situation = torch.ones(batch_size, 10, device=logits.device)
+    #         one_situation[:, i] = 0
+    #         wmc += torch.prod(one_situation - normalized_logits, dim=1)
+    #
+    #     return torch.abs(wmc)
     def compute_wmc(self, input):
         normalized_logits = torch.sigmoid(input)
-        # import pdb; pdb.set_trace()
-        batch_size = input.size(0)
-        wmc = torch.zeros(batch_size, device=input.device)
 
+        # Initialize wmc_tmp as a tensor of zeros
+        batch_number = input.shape[0]
+        wmc_tmp = torch.zeros(batch_number, device=normalized_logits.device)
+
+        # Loop to calculate WMC
         for i in range(10):
-            one_situation = torch.ones(batch_size, 10, device=input.device)
-            one_situation[:, i] = 0
-            wmc += torch.prod(one_situation - normalized_logits, dim=1)
+            one_situation = torch.cat([
+                torch.cat([torch.ones(batch_number, i, device=normalized_logits.device),
+                           torch.zeros(batch_number, 1, device=normalized_logits.device)], dim=1),
+                torch.ones(batch_number, 10 - i - 1, device=normalized_logits.device)
+            ], dim=1)
 
-        return torch.mean(torch.abs(wmc))
+            # Calculate the product for each situation and add it to wmc_tmp
+            wmc_tmp += torch.prod(one_situation - normalized_logits, dim=1)
+
+        wmc_tmp = torch.abs(wmc_tmp)
+        wmc = torch.mean(wmc_tmp)
+        return wmc
+
     def training_step(self, batch, batch_idx):
         images, labels, is_labeled = batch
         labels_onehot = F.one_hot(labels, 10).float()
@@ -101,22 +164,25 @@ class SemiSupervisedMNIST(pl.LightningModule):
         self.train()
         scores = self(images)
 
-        # Calculate WMC loss
+        # Calculate WMC loss for all examples
         wmc_values = self.compute_wmc(scores)
         log_wmc = torch.log(wmc_values + 1e-10)
         wmc_loss = -0.0005 * log_wmc
 
-        # Calculate cross entropy
-        cross_entropy = self.xentropy(scores, labels_onehot).sum(axis=1)
+        # Calculate cross entropy only for labeled examples
+        cross_entropy = self.xentropy(scores, labels_onehot)
 
         # Combine losses based on whether examples are labeled
+        count = sum(is_labeled)
+        if count != 0:
+            print(f'step {batch_idx}: is_labeled = \n{is_labeled}\nCount = {sum(is_labeled)}')
         loss = torch.where(
             is_labeled,
             wmc_loss + cross_entropy,  # labeled examples: both losses
             wmc_loss  # unlabeled examples: only WMC loss
         ).mean()
 
-        # Training acc
+        # Calculate accuracy only for labeled examples
         pred = scores.argmax(dim=1)
         # accuracy = (pred == labels)[is_labeled].float().mean() if is_labeled.any() else torch.tensor(0.0)
         accuracy = (pred == labels).float().mean()
@@ -125,6 +191,7 @@ class SemiSupervisedMNIST(pl.LightningModule):
         self.log('train_loss', loss)
         self.log('train_acc', accuracy)
         self.log('train_wmc', wmc_values.mean())
+        self.log('num_labeled', count)
 
         return loss
 
@@ -141,22 +208,9 @@ class SemiSupervisedMNIST(pl.LightningModule):
 
 
 class SemiSupervisedMNISTDataset(Dataset):
-    def __init__(self, dataset, num_labeled=None):
+    def __init__(self, dataset, labeled_indices=None):
         self.dataset = dataset
-        self.num_labeled = num_labeled
-
-        if num_labeled is not None:
-            # Get balanced labeled indices
-            all_labels = torch.tensor([label for _, label in dataset])
-            n_classes = 10
-            n_labels_per_class = num_labeled // n_classes
-
-            labeled_indices = []
-            for c in range(n_classes):
-                class_indices = (all_labels == c).nonzero().view(-1)
-                perm = torch.randperm(len(class_indices))
-                labeled_indices.extend(class_indices[perm[:n_labels_per_class]].tolist())
-
+        if labeled_indices is not None:
             self.labeled_mask = torch.zeros(len(dataset), dtype=torch.bool)
             self.labeled_mask[labeled_indices] = True
         else:
@@ -186,10 +240,9 @@ class MNISTDataModule(pl.LightningDataModule):
         full_train = datasets.MNIST('./data', train=True, transform=self.transform)
 
         if self.num_labeled < len(full_train):
-            # indices = torch.randperm(len(full_train))
-            # labeled_indices = indices[:self.num_labeled]
-            # self.train_dataset = SemiSupervisedMNISTDataset(full_train, labeled_indices)
-            self.train_dataset = SemiSupervisedMNISTDataset(full_train, self.num_labeled)
+            indices = torch.randperm(len(full_train))
+            labeled_indices = indices[:self.num_labeled]
+            self.train_dataset = SemiSupervisedMNISTDataset(full_train, labeled_indices)
         else:
             self.train_dataset = SemiSupervisedMNISTDataset(full_train)
 
@@ -214,7 +267,7 @@ def main(args):
     data_module = MNISTDataModule(args.num_labeled, args.batch_size)
 
     trainer = pl.Trainer(
-        max_epochs=200,
+        max_epochs=20,
         # max_steps=50000,
         val_check_interval=500,
         log_every_n_steps=200,
@@ -223,18 +276,13 @@ def main(args):
 
     trainer.fit(model, data_module)
 
-# count = 0
-counts = [0 for _ in range(10)]
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--num_labeled', type=int, required=True,
-                        help='Number of labeled examples for semi-supervised learning.')
+                        help='Number of labeled examples for semi-supervised learning')
     parser.add_argument('--batch_size', type=int, required=True,
-                        help='Batch size for mini-batch Adam gradient descent.')
-    parser.add_argument('--learning_rate', type=float, default=1e-4,
-                        help='Learning rate for the Adam optimizer.')
-    parser.add_argument('--semantic_weight', type=float, default=5e-4,
-                        help='Weight given to the semantic loss term within the total loss computation.')
+                        help='Batch size for mini-batch Adam gradient descent')
     args = parser.parse_args()
 
     main(args)
