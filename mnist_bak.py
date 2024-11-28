@@ -10,7 +10,7 @@ import numpy as np
 
 
 class SemiSupervisedMNIST(pl.LightningModule):
-    def __init__(self, keep_prob=0.5):
+    def __init__(self, semantic_weight=0.0005, keep_prob=0.5):
         super().__init__()
         self.extract = nn.Sequential(nn.Linear(784, 1000),
                                      nn.ReLU(),
@@ -26,6 +26,7 @@ class SemiSupervisedMNIST(pl.LightningModule):
                                      nn.Dropout(p=1-keep_prob))
         self.classify = nn.Linear(250, 10)
         self.xentropy = nn.BCEWithLogitsLoss()
+        self.semantic_weight = semantic_weight
 
     def standardize(self, image):
         """
@@ -34,38 +35,11 @@ class SemiSupervisedMNIST(pl.LightningModule):
         """
         image = image.view(-1, 28, 28, 1)
         num_pixels = 28 * 28
-        #
-        # # TF uses these exact constants
-        # image_mean = x.mean(dim=(1, 2), keepdim=True)
-        # variance = torch.var(x, dim=(1, 2), keepdim=True, unbiased=False)
-        # stddev = torch.sqrt(variance + 1e-6)
-        # min_stddev = torch.ones_like(stddev) / torch.sqrt(torch.tensor(num_pixels).float())
-        # pixel_value_scale = torch.max(stddev, min_stddev)
-        #
-        # x_normalized = (x - image_mean) / pixel_value_scale
-        # return x_normalized
-        """
-        Linearly scales each image in `image` to have mean 0 and variance 1.
-
-        Args:
-            image (torch.Tensor): An n-D Tensor with at least 3 dimensions, where the last 3 dimensions
-                                  represent the image (height, width, channels).
-
-        Returns:
-            torch.Tensor: A Tensor with the same shape as `image` and dtype `float32`, where each image
-                          has mean 0 and variance 1.
-
-        Raises:
-            ValueError: If the input image has fewer than 3 dimensions.
-        """
         if image.dim() < 3:
             raise ValueError("Input image must have at least 3 dimensions.")
 
         # Convert the image to float32 if it's not already
         image = image.to(torch.float32)
-
-        # Calculate the number of pixels in the last 3 dimensions (height, width, channels)
-        # num_pixels = image.numel() // image.shape[-3:]
 
         # Compute the mean over the last 3 dimensions (height, width, channels)
         image_mean = image.mean(dim=(-1, -2, -3), keepdim=True)
@@ -123,17 +97,6 @@ class SemiSupervisedMNIST(pl.LightningModule):
         x = self.classify(x)
         return x
 
-    # def compute_wmc(self, logits):
-    #     normalized_logits = torch.sigmoid(logits)
-    #     batch_size = logits.size(0)
-    #     wmc = torch.zeros(batch_size, device=logits.device)
-    #
-    #     for i in range(10):
-    #         one_situation = torch.ones(batch_size, 10, device=logits.device)
-    #         one_situation[:, i] = 0
-    #         wmc += torch.prod(one_situation - normalized_logits, dim=1)
-    #
-    #     return torch.abs(wmc)
     def compute_wmc(self, input):
         normalized_logits = torch.sigmoid(input)
 
@@ -167,15 +130,15 @@ class SemiSupervisedMNIST(pl.LightningModule):
         # Calculate WMC loss for all examples
         wmc_values = self.compute_wmc(scores)
         log_wmc = torch.log(wmc_values + 1e-10)
-        wmc_loss = -0.0005 * log_wmc
+        wmc_loss = -self.semantic_weight * log_wmc
 
         # Calculate cross entropy only for labeled examples
         cross_entropy = self.xentropy(scores, labels_onehot)
 
         # Combine losses based on whether examples are labeled
-        count = sum(is_labeled)
-        if count != 0:
-            print(f'step {batch_idx}: is_labeled = \n{is_labeled}\nCount = {sum(is_labeled)}')
+        # count = sum(is_labeled)
+        # if count != 0:
+        #     print(f'step {batch_idx}: is_labeled = \n{is_labeled}\nCount = {sum(is_labeled)}')
         loss = torch.where(
             is_labeled,
             wmc_loss + cross_entropy,  # labeled examples: both losses
@@ -191,7 +154,7 @@ class SemiSupervisedMNIST(pl.LightningModule):
         self.log('train_loss', loss)
         self.log('train_acc', accuracy)
         self.log('train_wmc', wmc_values.mean())
-        self.log('num_labeled', count)
+        # self.log('num_labeled', count)
 
         return loss
 
@@ -263,7 +226,7 @@ class MNISTDataModule(pl.LightningDataModule):
 
 
 def main(args):
-    model = SemiSupervisedMNIST()
+    model = SemiSupervisedMNIST(semantic_weight=args.semantic_weight)
     data_module = MNISTDataModule(args.num_labeled, args.batch_size)
 
     trainer = pl.Trainer(
@@ -283,6 +246,8 @@ if __name__ == '__main__':
                         help='Number of labeled examples for semi-supervised learning')
     parser.add_argument('--batch_size', type=int, required=True,
                         help='Batch size for mini-batch Adam gradient descent')
+    parser.add_argument('--semantic_weight', type=float, required=True, default=0.0005,
+                        help='Semantic Weight')
     args = parser.parse_args()
 
     main(args)

@@ -7,11 +7,13 @@ import torchvision.transforms.v2
 from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets, transforms
 import pytorch_lightning as pl
+from lightning.pytorch import loggers
 import numpy as np
+from semantic_loss_pytorch import SemanticLoss
 
 
 class SemiSupervisedMNIST(pl.LightningModule):
-    def __init__(self, keep_prob=0.5):
+    def __init__(self, keep_prob=0.5, semantic_weight=5e-4, learning_rate=1e-4):
         super().__init__()
         self.extract = nn.Sequential(nn.Linear(784, 1000),
                                      nn.ReLU(),
@@ -26,6 +28,8 @@ class SemiSupervisedMNIST(pl.LightningModule):
                                      nn.BatchNorm1d(250, eps=0.001, momentum=0.99),
                                      nn.Dropout(p=1-keep_prob))
         self.classify = nn.Linear(250, 10)
+        self.semantic_weight = semantic_weight
+        self.learning_rate = learning_rate
 
         def init_weights(layer):
             if isinstance(layer, nn.Linear):
@@ -36,6 +40,7 @@ class SemiSupervisedMNIST(pl.LightningModule):
         self.classify.bias.data.fill_(0.)
 
         self.xentropy = nn.BCEWithLogitsLoss(reduction='none')
+        # self.sl = SemanticLoss('constraint.sdd', 'constraint.vtree')
         # self.crop = torchvision.transforms.v2.Compose([torchvision.transforms.v2.RandomCrop(size=25),
         #                                                torchvision.transforms.v2.Resize(size=26, antialias=True),
         #                                                torchvision.transforms.v2.Pad(padding=1)])
@@ -83,6 +88,7 @@ class SemiSupervisedMNIST(pl.LightningModule):
 
     def compute_wmc(self, input):
         normalized_logits = torch.sigmoid(input)
+        # normalized_logits = torch.softmax(input, dim=-1)
         # import pdb; pdb.set_trace()
         batch_size = input.size(0)
         wmc = torch.zeros(batch_size, device=input.device)
@@ -93,6 +99,17 @@ class SemiSupervisedMNIST(pl.LightningModule):
             wmc += torch.prod(one_situation - normalized_logits, dim=1)
 
         return torch.mean(torch.abs(wmc))
+
+    def compute_wmc_2(self, input):
+        normalized_logits = torch.sigmoid(input)
+        # normalized_logits = torch.softmax(input, dim=-1).unsqueeze(1).repeat(1, 10, 1)
+        state_probs_in_that_world = torch.where(torch.eye(10, dtype=bool, device=self.device).unsqueeze(0).repeat(len(normalized_logits), 1, 1),
+                                                normalized_logits,
+                                                1 - normalized_logits)
+        world_probs = torch.prod(state_probs_in_that_world, dim=-1)
+        wmc_values = torch.sum(world_probs, dim=-1)
+        return wmc_values
+
     def training_step(self, batch, batch_idx):
         images, labels, is_labeled = batch
         labels_onehot = F.one_hot(labels, 10).float()
@@ -102,12 +119,13 @@ class SemiSupervisedMNIST(pl.LightningModule):
         scores = self(images)
 
         # Calculate WMC loss
-        wmc_values = self.compute_wmc(scores)
+        wmc_values = self.compute_wmc_2(scores)
         log_wmc = torch.log(wmc_values + 1e-10)
-        wmc_loss = -0.0005 * log_wmc
+        wmc_loss = -self.semantic_weight * log_wmc
 
         # Calculate cross entropy
         cross_entropy = self.xentropy(scores, labels_onehot).sum(axis=1)
+        # semantic_loss = self.sl(probabilities=torch.softmax(scores, dim=-1))
 
         # Combine losses based on whether examples are labeled
         loss = torch.where(
@@ -115,6 +133,12 @@ class SemiSupervisedMNIST(pl.LightningModule):
             wmc_loss + cross_entropy,  # labeled examples: both losses
             wmc_loss  # unlabeled examples: only WMC loss
         ).mean()
+
+        # loss = torch.where(
+        #     is_labeled,
+        #     semantic_loss + cross_entropy,  # labeled examples: both losses
+        #     semantic_loss  # unlabeled examples: only WMC loss
+        # ).mean()
 
         # Training acc
         pred = scores.argmax(dim=1)
@@ -124,7 +148,7 @@ class SemiSupervisedMNIST(pl.LightningModule):
         # Log metrics
         self.log('train_loss', loss)
         self.log('train_acc', accuracy)
-        self.log('train_wmc', wmc_values.mean())
+        # self.log('train_wmc', wmc_values.mean())
 
         return loss
 
@@ -137,7 +161,7 @@ class SemiSupervisedMNIST(pl.LightningModule):
         return accuracy
 
     def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=1e-4)
+        return torch.optim.Adam(self.parameters(), lr=self.learning_rate)
 
 
 class SemiSupervisedMNISTDataset(Dataset):
@@ -210,15 +234,22 @@ class MNISTDataModule(pl.LightningDataModule):
 
 
 def main(args):
-    model = SemiSupervisedMNIST()
+    logger = loggers.TensorBoardLogger(save_dir='lightning_logs',
+                                       name=f'labeled-{args.num_labeled}_'
+                                            f'batch-{args.batch_size}_'
+                                            f'sw_{args.semantic_weight}'
+                                            f'lr_{args.learning_rate}')
+    model = SemiSupervisedMNIST(semantic_weight=args.semantic_weight, learning_rate=args.learning_rate)
     data_module = MNISTDataModule(args.num_labeled, args.batch_size)
 
     trainer = pl.Trainer(
-        max_epochs=200,
+        max_epochs=10,
         # max_steps=50000,
-        val_check_interval=500,
-        log_every_n_steps=200,
+        val_check_interval=2000,
+        log_every_n_steps=2000,
         accelerator='auto',
+        # num_nodes=8,
+        logger=logger
     )
 
     trainer.fit(model, data_module)
